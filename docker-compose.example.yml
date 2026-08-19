@@ -1,0 +1,18 @@
+# glm-cc-gateway 部署参考(拉取 ghcr.io 发布镜像,无需本地源码)。
+#
+# 使用:
+#   cp docker-compose.example.yml docker-compose.yml
+#   docker compose up -d
+#   首启自动生成 ./data/config.json,编辑后 docker compose restart
+#
+# 注意:镜像包默认 private,拉取前需 docker login ghcr.io
+# (GitHub 用户名 + 具有 read:packages 权限的 token);公开包可直接拉取。
+services:
+  glm-cc-gateway:
+    image: ghcr.io/redcath/glm-cc-gateway:latest    # 默认最新版;生产建议锁定具体版本(如 0.1.0)
+    container_name: glm-cc-gateway
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./data:/app/data      # 配置/身份/会话池/用量全在此目录,持久保留
+    restart: unless-stopped

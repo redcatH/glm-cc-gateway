@@ -20,10 +20,11 @@ go run .    # 首次运行自动生成 data/config.json,按需修改后重启
 
 配置与状态(config.json / identity.json / sessions.json / usage.json / dumps)全部落在挂载的 `data/` 目录,容器本身无状态。
 
-### 方式一:docker compose(推荐)
+### 方式一:docker compose + ghcr 镜像(部署推荐,无需源码)
 
 ```bash
-# 在项目根目录(与 docker-compose.yml 同级)执行
+# 复制部署模板(镜像指向 ghcr 发布版):
+cp docker-compose.example.yml docker-compose.yml
 docker compose up -d
 
 # 1. 首次启动会自动在 ./data/config.json 生成默认配置(监听 0.0.0.0:8080)
@@ -35,36 +36,37 @@ docker compose restart
 docker compose logs -f
 docker compose ps
 docker compose down        # ./data 数据保留
+
+# 镜像包默认 private,拉取前需 docker login ghcr.io
+# (GitHub 用户名 + 具有 read:packages 权限的 token);公开包可直接拉取
 ```
 
-### 方式二:docker run
+### 方式二:docker run(ghcr 镜像)
 
 ```bash
-# 本地构建镜像
-docker build -t glm-cc-gateway .
+docker run -d \
+  --name glm-cc-gateway \
+  -p 8080:8080 \
+  -v "$PWD/data:/app/data" \
+  --restart unless-stopped \
+  ghcr.io/redcath/glm-cc-gateway:latest    # 或锁定版本,如 :0.1.0
+# 首启自动生成 ./data/config.json,编辑后重启:
+docker restart glm-cc-gateway
+```
 
-# 运行:数据挂载到当前目录 ./data(自动创建),随宿主机持久化
+### 方式三:本地源码构建(开发用)
+
+```bash
+# 仓库内 docker-compose.yml 即本地构建版(build: .):
+docker compose up -d
+# 或手动构建运行:
+docker build -t glm-cc-gateway .
 docker run -d \
   --name glm-cc-gateway \
   -p 8080:8080 \
   -v "$PWD/data:/app/data" \
   --restart unless-stopped \
   glm-cc-gateway
-
-# 首启自动生成 ./data/config.json,编辑后重启:
-docker restart glm-cc-gateway
-```
-
-### 使用 ghcr 发布的镜像(推 tag 后 CI 自动构建)
-
-```bash
-docker run -d \
-  --name glm-cc-gateway \
-  -p 8080:8080 \
-  -v "$PWD/data:/app/data" \
-  --restart unless-stopped \
-  ghcr.io/<owner>/glm-cc-gateway:0.1.0
-# 或 docker-compose.yml 中把 build: . 换成上面的 image: 后 docker compose up -d
 ```
 
 ### 下游客户端接入
