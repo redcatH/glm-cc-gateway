@@ -1,0 +1,23 @@
+{
+  "listen": "127.0.0.1:8080",
+  "upstream_base_url": "https://open.bigmodel.cn/api/anthropic",
+  "upstream_auth_scheme": "bearer",
+  "upstream_path": "/v1/messages?beta=true",
+  "count_tokens_path": "/v1/messages/count_tokens?beta=true",
+  "identity_file": "data/identity.json",
+  "dump_dir": "",
+  "dump_retention_hours": 72,
+  "api_keys_allow": [],
+  "model_map": {},
+  "max_body_bytes": 33554432,
+  "max_upstream_retries": 2,
+  "behavior": {
+    "max_concurrency": 2,
+    "rpm_limit": 60,
+    "queue_timeout_seconds": 120,
+    "session_pool_size": 3,
+    "session_rotate_min_minutes": 120,
+    "session_rotate_max_minutes": 360,
+    "daily_token_budget": 0
+  }
+}

@@ -1,0 +1,17 @@
+# Local runtime config (use config.example.json as template)
+config.json
+
+# Runtime data: persisted client identities & request dumps
+data/
+
+# Runtime usage statistics
+usage.json
+
+# Go build artifacts
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
