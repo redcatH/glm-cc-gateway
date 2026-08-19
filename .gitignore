@@ -8,6 +8,7 @@ data/
 usage.json
 
 # Go build artifacts
+glm-cc-gateway
 *.exe
 *.exe~
 *.dll
@@ -15,3 +16,8 @@ usage.json
 *.dylib
 *.test
 *.out
+
+# Editors
+.idea/
+.vscode/
+*.swp

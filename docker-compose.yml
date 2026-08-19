@@ -1,0 +1,19 @@
+# glm-cc-gateway 容器编排。
+# 数据(配置/身份/会话池/用量/dump)全部落在 ./data,首次启动自动生成默认配置。
+#
+# 用法:
+#   docker compose up -d          # 本地构建并运行
+#   首启后编辑 ./data/config.json(上游 base_url / model_map / behavior),再 restart 生效
+#
+# 若使用 ghcr 发布的镜像(推 tag 后 CI 自动构建),把 build/image 换成:
+#   image: ghcr.io/<你的用户名>/glm-cc-gateway:<tag>
+services:
+  glm-cc-gateway:
+    build: .
+    image: glm-cc-gateway:local
+    container_name: glm-cc-gateway
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./data:/app/data
+    restart: unless-stopped

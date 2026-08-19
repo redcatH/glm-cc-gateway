@@ -16,13 +16,18 @@ import (
 )
 
 func main() {
-	cfgPath := flag.String("config", "config.json", "配置文件路径")
+	cfgPath := flag.String("config", config.DefaultConfigPath, "配置文件路径")
 	flag.Parse()
 
-	cfg, err := config.Load(*cfgPath)
+	cfg, created, err := config.LoadOrCreate(*cfgPath)
 	if err != nil {
-		slog.Error("load config", "err", err)
+		slog.Error("load config", "path", *cfgPath, "err", err)
 		os.Exit(1)
+	}
+	if created {
+		slog.Info("generated default config",
+			"path", *cfgPath,
+			"hint", "edit upstream_base_url / model_map / behavior and restart")
 	}
 
 	ident, err := mimic.NewIdentityStore(cfg.IdentityFile)

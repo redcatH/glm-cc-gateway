@@ -5,7 +5,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 )
+
+// DefaultConfigPath 是配置文件的默认路径(与状态文件同在 data/ 下,
+// 容器部署只需挂载一个卷)。
+const DefaultConfigPath = "data/config.json"
 
 // Config 是网关的全部配置。
 type Config struct {
@@ -96,7 +101,7 @@ func Load(path string) (*Config, error) {
 
 func (c *Config) applyDefaults() {
 	if c.Listen == "" {
-		c.Listen = "127.0.0.1:8080"
+		c.Listen = "0.0.0.0:8080" // 容器友好;本地裸跑可改 127.0.0.1:8080
 	}
 	if c.UpstreamAuthScheme == "" {
 		c.UpstreamAuthScheme = "bearer"
@@ -138,4 +143,63 @@ func (c *Config) applyDefaults() {
 	if c.DumpRetentionHours < 0 {
 		c.DumpRetentionHours = 0
 	}
+}
+
+// DefaultConfig 返回内置默认配置(容器友好:监听 0.0.0.0,
+// 上游指向智谱 Anthropic 兼容端点,dump 关闭,行为收敛取建议值)。
+func DefaultConfig() *Config {
+	return &Config{
+		Listen:             "0.0.0.0:8080",
+		UpstreamBaseURL:    "https://open.bigmodel.cn/api/anthropic",
+		UpstreamAuthScheme: "bearer",
+		UpstreamPath:       "/v1/messages?beta=true",
+		CountTokensPath:    "/v1/messages/count_tokens?beta=true",
+		IdentityFile:       "data/identity.json",
+		DumpDir:            "",
+		DumpRetentionHours: 72,
+		ModelMap:           map[string]string{},
+		MaxBodyBytes:       32 << 20,
+		MaxUpstreamRetries: 2,
+		Behavior: Behavior{
+			MaxConcurrency:          2,
+			RPMLimit:                60,
+			QueueTimeoutSeconds:     120,
+			SessionPoolSize:         3,
+			SessionRotateMinMinutes: 120,
+			SessionRotateMaxMinutes: 360,
+			DailyTokenBudget:        0,
+		},
+	}
+}
+
+// LoadOrCreate 加载 path 处的配置;文件不存在时写入默认配置并返回
+// (created=true)。容器首次启动由此获得可编辑的默认配置文件。
+func LoadOrCreate(path string) (cfg *Config, created bool, err error) {
+	if _, statErr := os.Stat(path); statErr == nil {
+		c, err := Load(path)
+		return c, false, err
+	}
+	c := DefaultConfig()
+	if wErr := writeConfigFile(path, c); wErr != nil {
+		// 写盘失败(如只读卷)不阻塞启动,用内存默认值继续。
+		slogFn(wErr)
+	}
+	return c, true, nil
+}
+
+func slogFn(err error) {
+	fmt.Fprintln(os.Stderr, "config: write default failed:", err)
+}
+
+func writeConfigFile(path string, c *Config) error {
+	if dir := filepath.Dir(path); dir != "" && dir != "." {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return err
+		}
+	}
+	data, err := json.MarshalIndent(c, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, append(data, '\n'), 0o600)
 }

@@ -1,5 +1,5 @@
 {
-  "listen": "127.0.0.1:8080",
+  "listen": "0.0.0.0:8080",
   "upstream_base_url": "https://open.bigmodel.cn/api/anthropic",
   "upstream_auth_scheme": "bearer",
   "upstream_path": "/v1/messages?beta=true",

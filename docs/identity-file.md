@@ -1,6 +1,6 @@
 # `identity_file` 是什么
 
-`"identity_file": "data/identity.json"` 是网关的**伪装身份持久化存储**——记录“每个下游 key 对应的假 Claude Code 客户端身份(device_id)”。
+`"identity_file": "data/identity.json"` 是网关的**客户端身份持久化存储**——记录“每个下游 key 对应的 Claude Code 客户端身份(device_id)”。
 
 ## 为什么需要它
 
@@ -12,7 +12,7 @@
 - 之后该 key 的所有请求(包括网关**重启后**)都从文件读回同一个值,永不更换
 - 不同 key 生成不同 device_id → 在上游眼里是互不相干的多个独立用户
 
-如果不落盘,网关每次重启 device_id 都会变,上游视角就是“这个 key 老是换机器”——反而成了可疑信号。
+如果不落盘,网关每次重启 device_id 都会变,上游视角则是“该 key 频繁更换设备”,属于异常特征。
 
 ## 文件内容长什么样
 
