@@ -47,7 +47,6 @@ docker compose down        # ./data 数据保留
 docker run -d \
   --name glm-cc-gateway \
   -p 127.0.0.1:8080:8080 \
-  -e TZ=Asia/Shanghai \
   -v "$PWD/data:/app/data" \
   --restart unless-stopped \
   ghcr.io/redcath/glm-cc-gateway:latest    # 或锁定版本,如 :0.1.0
@@ -89,7 +88,7 @@ git tag v0.1.0 && git push origin v0.1.0
 ```
 
 容器内默认监听 `0.0.0.0`(端口映射需要);本地裸跑想仅本机访问可在 config 中改为 `127.0.0.1:8080`。
-时区:镜像内置 tzdata,`TZ` 环境变量决定每日用量统计的日期分桶(默认 UTC;compose 模板已设 `Asia/Shanghai`)。
+时区:镜像默认 `TZ=Asia/Shanghai`(内置 tzdata),如需覆盖可设 `TZ` 环境变量;每日用量统计按该时区的日期零点重置。
 安全:示例部署默认把端口绑在宿主机 `127.0.0.1`;网关默认不限制下游 key(`api_keys_allow: []`),
 若开放到局域网/公网,请先在配置中设置 key 白名单。
 

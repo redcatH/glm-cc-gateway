@@ -13,6 +13,7 @@ RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH \
 # tzdata: TZ 环境变量生效,每日用量按本地日期重置。
 FROM alpine:3.20
 RUN apk add --no-cache ca-certificates tzdata
+ENV TZ=Asia/Shanghai
 WORKDIR /app
 COPY --from=build /out/glm-cc-gateway /usr/local/bin/glm-cc-gateway
 RUN mkdir -p /app/data
