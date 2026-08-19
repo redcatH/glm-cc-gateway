@@ -12,7 +12,11 @@ services:
     image: ghcr.io/redcath/glm-cc-gateway:latest    # 默认最新版;生产建议锁定具体版本(如 0.1.0)
     container_name: glm-cc-gateway
     ports:
-      - "8080:8080"
+      # 默认仅本机可达;网关对下游 key 默认无白名单限制,
+      # 开放局域网/公网前请配置 api_keys_allow,或改为 "8080:8080"
+      - "127.0.0.1:8080:8080"
+    environment:
+      TZ: Asia/Shanghai    # 每日用量统计按本地日期零点重置
     volumes:
       - ./data:/app/data      # 配置/身份/会话池/用量全在此目录,持久保留
     restart: unless-stopped

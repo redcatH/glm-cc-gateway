@@ -6,7 +6,7 @@ services:
     image: glm-cc-gateway:local
     container_name: glm-cc-gateway
     ports:
-      - "8080:8080"
+      - "127.0.0.1:8080:8080"   # 默认仅本机可达,开放前请配置 api_keys_allow
     volumes:
       - ./data:/app/data      # 配置/身份/会话池/用量全在此目录,持久保留
     restart: unless-stopped

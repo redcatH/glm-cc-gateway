@@ -46,7 +46,8 @@ docker compose down        # ./data 数据保留
 ```bash
 docker run -d \
   --name glm-cc-gateway \
-  -p 8080:8080 \
+  -p 127.0.0.1:8080:8080 \
+  -e TZ=Asia/Shanghai \
   -v "$PWD/data:/app/data" \
   --restart unless-stopped \
   ghcr.io/redcath/glm-cc-gateway:latest    # 或锁定版本,如 :0.1.0
@@ -63,7 +64,7 @@ docker compose up -d
 docker build -t glm-cc-gateway .
 docker run -d \
   --name glm-cc-gateway \
-  -p 8080:8080 \
+  -p 127.0.0.1:8080:8080 \
   -v "$PWD/data:/app/data" \
   --restart unless-stopped \
   glm-cc-gateway
@@ -82,11 +83,15 @@ export ANTHROPIC_AUTH_TOKEN=<你的上游key>   # 网关透传该 key,不做自�
 
 ```bash
 git tag v0.1.0 && git push origin v0.1.0
-# 生成镜像 tag:v0.1.0(semver)→ 0.1.0 与 0.1;非 semver tag → 同名
+# 生成镜像 tag:v0.1.0(semver)→ 0.1.0 与 0.1;非 semver tag → 同名;任意 tag 均同步更新 latest
+# 多架构:linux/amd64 与 linux/arm64(Go 交叉编译)
 # 首次发布后包默认 private,公开需到 GitHub → Packages 手动切换
 ```
 
 容器内默认监听 `0.0.0.0`(端口映射需要);本地裸跑想仅本机访问可在 config 中改为 `127.0.0.1:8080`。
+时区:镜像内置 tzdata,`TZ` 环境变量决定每日用量统计的日期分桶(默认 UTC;compose 模板已设 `Asia/Shanghai`)。
+安全:示例部署默认把端口绑在宿主机 `127.0.0.1`;网关默认不限制下游 key(`api_keys_allow: []`),
+若开放到局域网/公网,请先在配置中设置 key 白名单。
 
 验证:配置 `dump_dir`(默认关闭,调试时设为 `data/dumps`)后,每个请求落盘 3 份对照文件(下游原始 / 改写后 / 上游头),可与真实 CC 抓包做字段级 diff;`dump_retention_hours`(默认 72,0=不清理)自动清理过期 dump。注意 dump 含对话明文,仅调试时开启。
 
