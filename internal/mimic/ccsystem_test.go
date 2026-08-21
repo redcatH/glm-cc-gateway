@@ -236,3 +236,57 @@ func countCacheControls(t *testing.T, body []byte) int {
 	walk(top)
 	return count
 }
+
+func TestStripDeferredToolCacheControl(t *testing.T) {
+	body, _ := json.Marshal(map[string]any{
+		"model": "m",
+		"tools": []any{
+			// 普通工具带断点:保留
+			map[string]any{"name": "normal", "cache_control": map[string]string{"type": "ephemeral"}},
+			// 官方顶层 defer_loading=true:剥离
+			map[string]any{"name": "d1", "defer_loading": true, "cache_control": map[string]string{"type": "ephemeral"}},
+			// Claude Code 形态 custom.defer_loading=true:剥离
+			map[string]any{"name": "d2", "custom": map[string]any{"defer_loading": true}, "cache_control": map[string]string{"type": "ephemeral"}},
+			// 字符串 "true" 不是字面量 true:保留
+			map[string]any{"name": "s1", "defer_loading": "true", "cache_control": map[string]string{"type": "ephemeral"}},
+			// false:保留
+			map[string]any{"name": "s2", "defer_loading": false, "cache_control": map[string]string{"type": "ephemeral"}},
+		},
+		"messages": []any{},
+	})
+	out := EnforceCacheControlLimit(body)
+
+	var top struct {
+		Tools []map[string]any `json:"tools"`
+	}
+	if err := json.Unmarshal(out, &top); err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]bool{
+		"normal": true,  // 保留
+		"d1":     false, // 剥离
+		"d2":     false, // 剥离
+		"s1":     true,  // 字符串不算
+		"s2":     true,  // false 不算
+	}
+	for _, tool := range top.Tools {
+		name, _ := tool["name"].(string)
+		_, hasCC := tool["cache_control"]
+		if hasCC != want[name] {
+			t.Errorf("tool %q cache_control present=%v, want %v", name, hasCC, want[name])
+		}
+	}
+
+	// deferred 工具被剥离的断点不占用 4 块配额:上述 3 个合法断点 < 4,全部保留。
+	if got := countCacheControls(t, out); got != 3 {
+		t.Fatalf("cache_control count = %d, want 3", got)
+	}
+}
+
+func TestStripDeferredToolCacheControlNoTools(t *testing.T) {
+	// 无 tools / tools 非数组:原样返回。
+	body, _ := json.Marshal(map[string]any{"model": "m", "messages": []any{}})
+	if out := StripDeferredToolCacheControl(body); string(out) != string(body) {
+		t.Fatal("body without tools must be untouched")
+	}
+}

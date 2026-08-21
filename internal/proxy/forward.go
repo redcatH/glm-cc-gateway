@@ -3,6 +3,7 @@ package proxy
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -12,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -27,6 +29,9 @@ type Forwarder struct {
 	limiter  *guard.Limiter
 	pool     *guard.SessionPool
 	usage    *guard.UsageTracker
+	cooldown *guard.RateLimitCooldown
+	quota    *guard.QuotaService
+	ring     *guard.KeyRing
 	client   *http.Client
 	allowSet map[string]struct{}
 }
@@ -39,15 +44,55 @@ func New(cfg *config.Config, ident *mimic.IdentityStore) *Forwarder {
 	}
 	b := cfg.Behavior
 	dir := filepath.Dir(cfg.IdentityFile)
+	client := &http.Client{Timeout: 0} // 流式长连接不设整体超时,由 X-Stainless-Timeout 语义兜底
+	cooldown := guard.NewRateLimitCooldown()
+	ring := guard.NewKeyRing()
 	return &Forwarder{
 		cfg:      cfg,
 		ident:    ident,
 		limiter:  guard.NewLimiter(b.MaxConcurrency, b.RPMLimit),
 		pool:     guard.NewSessionPool(filepath.Join(dir, "sessions.json"), b.SessionPoolSize, time.Duration(b.SessionRotateMinMinutes)*time.Minute, time.Duration(b.SessionRotateMaxMinutes)*time.Minute),
 		usage:    guard.NewUsageTracker(filepath.Join(dir, "usage.json"), b.DailyTokenBudget),
-		client:   &http.Client{Timeout: 0}, // 流式长连接不设整体超时,由 X-Stainless-Timeout 语义兜底
+		cooldown: cooldown,
+		quota:    guard.NewQuotaService(client, cfg.UpstreamBaseURL, cooldown),
+		ring:     ring,
+		client:   client,
 		allowSet: allow,
 	}
+}
+
+// Quota 供 /quota 端点:按下游 key 查询额度(refresh=true 绕过缓存并解冻)。
+func (f *Forwarder) Quota(ctx context.Context, identityKey, apiKey string, refresh bool) (*guard.QuotaResult, error) {
+	return f.quota.Get(ctx, identityKey, apiKey, refresh)
+}
+
+// QuotaAllKeyEntry 是免 key 列表模式的单项(仅暴露身份键前缀,不回显原文)。
+type QuotaAllKeyEntry struct {
+	Key           string             `json:"key"` // 身份键前 8 位
+	Quota         *guard.QuotaResult `json:"quota,omitempty"`
+	Error         string             `json:"error,omitempty"`
+	CooldownUntil string             `json:"cooldown_until,omitempty"`
+}
+
+// QuotaAll 供 /quota 免 key 模式:查询内存 KeyRing 中所有出现过的 key 的额度
+// (原文仅内存,重启后由各 key 首个请求重新记录)。refresh=true 时全部实时探测并解冻。
+func (f *Forwarder) QuotaAll(ctx context.Context, refresh bool) []QuotaAllKeyEntry {
+	all := f.ring.All()
+	out := make([]QuotaAllKeyEntry, 0, len(all))
+	for idKey, apiKey := range all {
+		entry := QuotaAllKeyEntry{Key: idKey[:8]}
+		if until, ok := f.cooldown.Get(idKey); ok && time.Now().Before(until) {
+			entry.CooldownUntil = until.Format(time.RFC3339)
+		}
+		result, err := f.quota.Get(ctx, idKey, apiKey, refresh)
+		if err != nil {
+			entry.Error = err.Error()
+		} else {
+			entry.Quota = result
+		}
+		out = append(out, entry)
+	}
+	return out
 }
 
 // KeyStatEntry 是 /stats 暴露的单 key 画像。
@@ -58,6 +103,7 @@ type KeyStatEntry struct {
 	SessionsActive int    `json:"sessions_active"`
 	TokensToday    int64  `json:"tokens_today"`
 	RequestsToday  int64  `json:"requests_today"`
+	CooldownUntil  string `json:"cooldown_until,omitempty"` // 窗口上限冻结截止(RFC3339),空=无冻结
 }
 
 // Stats 汇总各 key 当日行为画像(供 /stats)。
@@ -82,6 +128,9 @@ func (f *Forwarder) Stats() []KeyStatEntry {
 		entry.ConcurrencyNow = f.limiter.InFlight(k)
 		entry.RPMLastMinute = f.limiter.RPMCount(k)
 		entry.SessionsActive = f.pool.ActiveSessions(k)
+		if until, ok := f.cooldown.Get(k); ok && time.Now().Before(until) {
+			entry.CooldownUntil = until.Format(time.RFC3339)
+		}
 		for _, s := range f.usage.SnapshotToday() {
 			if s.Key == k {
 				entry.TokensToday = s.TokensToday
@@ -93,8 +142,8 @@ func (f *Forwarder) Stats() []KeyStatEntry {
 	return out
 }
 
-// extractAPIKey 从下游请求头提取上游 key:优先 Authorization: Bearer,其次 x-api-key。
-func extractAPIKey(r *http.Request) string {
+// ExtractAPIKey 从下游请求头提取上游 key:优先 Authorization: Bearer,其次 x-api-key。
+func ExtractAPIKey(r *http.Request) string {
 	auth := r.Header.Get("Authorization")
 	if auth != "" {
 		if strings.HasPrefix(auth, "Bearer ") {
@@ -123,7 +172,7 @@ var hopByHopHeaders = []string{
 // HandleMessages 处理 /v1/messages(及 count_tokens)请求。
 func (f *Forwarder) HandleMessages(upstreamPath string, extraBetas []string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		apiKey := extractAPIKey(r)
+		apiKey := ExtractAPIKey(r)
 		if apiKey == "" {
 			http.Error(w, `{"type":"error","message":"missing API key: set Authorization: Bearer <key> or x-api-key"}`, http.StatusUnauthorized)
 			return
@@ -141,8 +190,26 @@ func (f *Forwarder) HandleMessages(upstreamPath string, extraBetas []string) htt
 			return
 		}
 
-		// === 行为收敛:预算 → 排队(并发+RPM)→ 会话池 ===
+		// === 行为收敛:冻结 → 预算 → 排队(并发+RPM)→ 会话池 ===
 		identityKey := mimic.KeyIdentityHash(apiKey)
+		f.ring.Record(identityKey, apiKey) // 内存 KeyRing:供 /quota 免 key 反查(原文不落盘)
+
+		// 窗口上限冻结:冻结期内直接 429(Retry-After),不发上游;
+		// 冻结已到期则清除并后台刷新额度(恢复点确认)。
+		if until, ok := f.cooldown.Get(identityKey); ok {
+			if time.Now().Before(until) {
+				slog.Warn("rate-limit cooldown active", "key", identityKey[:8], "until", until.Format(time.RFC3339))
+				w.Header().Set("Content-Type", "application/json")
+				w.Header().Set("Retry-After", strconv.Itoa(guard.RetryAfterSeconds(until)))
+				w.WriteHeader(http.StatusTooManyRequests)
+				msg := fmt.Sprintf(`{"type":"error","error":{"type":"rate_limit_error","message":"usage window limit reached; cooldown active, resets at %s (Beijing %s)"}}`,
+					until.Format(time.RFC3339), guard.FormatBeijing(until))
+				w.Write([]byte(msg)) //nolint:errcheck
+				return
+			}
+			f.cooldown.Clear(identityKey)
+			f.quota.RecoverAsync(identityKey, apiKey)
+		}
 
 		if f.usage.Exceeded(identityKey) {
 			slog.Warn("daily token budget exceeded", "key", identityKey[:8])
@@ -203,6 +270,7 @@ func (f *Forwarder) HandleMessages(upstreamPath string, extraBetas []string) htt
 		slog.Info("forward", "downstream", r.Method+" "+r.URL.Path, "upstream", targetURL)
 		var resp *http.Response
 		var lastErr error
+		var plain429Body []byte // 最后一次"普通 429"(无重置信息)的响应体,重试用尽后透传
 		for attempt := 0; ; attempt++ {
 			req, buildErr := http.NewRequestWithContext(r.Context(), http.MethodPost, targetURL, bytes.NewReader(newBody))
 			if buildErr != nil {
@@ -226,13 +294,32 @@ func (f *Forwarder) HandleMessages(upstreamPath string, extraBetas []string) htt
 			}
 
 			resp, lastErr = f.client.Do(req)
-			if lastErr == nil {
-				if resp.StatusCode < 500 && resp.StatusCode != http.StatusTooManyRequests {
-					break
-				}
-				lastErr = fmt.Errorf("upstream status %d", resp.StatusCode)
-				io.Copy(io.Discard, resp.Body) //nolint:errcheck
+			if lastErr != nil {
+				resp = nil
+			} else if code := resp.StatusCode; code < 500 && code != http.StatusTooManyRequests {
+				break
+			} else {
+				// 5xx / 429:读出响应体再决定走向。
+				errBody, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
 				resp.Body.Close()
+				resp = nil
+				lastErr = fmt.Errorf("upstream status %d", code)
+				if code == http.StatusTooManyRequests {
+					// 窗口上限(消息自带重置时间,如 1308):冻结到重置时刻,
+					// 跳过重试(硬上限重试无意义),原样透传错误体 + Retry-After。
+					if until, ok := guard.ParseZhipuRateLimitReset(errBody); ok {
+						f.cooldown.Set(identityKey, until)
+						slog.Warn("rate-limit cooldown set", "key", identityKey[:8],
+							"until", until.Format(time.RFC3339))
+						f.quota.CalibrateAsync(identityKey, apiKey, until)
+						w.Header().Set("Content-Type", "application/json")
+						w.Header().Set("Retry-After", strconv.Itoa(guard.RetryAfterSeconds(until)))
+						w.WriteHeader(http.StatusTooManyRequests)
+						w.Write(errBody) //nolint:errcheck
+						return
+					}
+					plain429Body = errBody
+				}
 			}
 			if attempt >= f.cfg.MaxUpstreamRetries || r.Context().Err() != nil {
 				break
@@ -242,13 +329,16 @@ func (f *Forwarder) HandleMessages(upstreamPath string, extraBetas []string) htt
 			case <-r.Context().Done():
 			}
 		}
-		if lastErr != nil && resp == nil {
+		if resp == nil {
+			// 重试用尽:优先透传最后一次普通 429 的原始错误体。
+			if len(plain429Body) > 0 {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusTooManyRequests)
+				w.Write(plain429Body) //nolint:errcheck
+				return
+			}
 			slog.Error("upstream request failed", "err", lastErr)
 			http.Error(w, `{"type":"error","message":"upstream request failed"}`, http.StatusBadGateway)
-			return
-		}
-		if resp == nil {
-			http.Error(w, `{"type":"error","message":"upstream unavailable"}`, http.StatusBadGateway)
 			return
 		}
 		defer resp.Body.Close()

@@ -105,7 +105,7 @@ git tag v0.1.0 && git push origin v0.1.0
 | 真 CC 直连分流 | ✅ | system 含 billing block 的请求只做 cc_version→UA 版本同步,不重写 system(保护其 prompt cache,对齐 sub2api isClaudeCode 跳过) |
 | system 3-block 重写 | ✅ | 第三方客户端流量:billing block(fp 按内容计算)+ CC banner + sub2api 中性扩充段(ephemeral ttl=5m);原 system 降级注入 messages 开头 `[System Instructions]` user 消息 + "Understood..." assistant 对 |
 | 参数归一化 | ✅ | 缺省补齐(不覆盖客户端值):tools[]、temperature=1、max_tokens=128000、thinking 时 context_management(对齐 sub2api normalizeClaudeOAuthRequestBody) |
-| cache_control 限制 | ✅ | ≤4 块;thinking 块非法 cache_control 一律删;超限按 tools(后往前)→ messages(前往后)→ system 顺序删(对齐 sub2api enforceCacheControlLimit) |
+| cache_control 限制 | ✅ | ≤4 块;thinking 块非法 cache_control 一律删;延迟加载工具(defer_loading / custom.defer_loading 字面量 true)的 cache_control 一律剥离(上游会拒绝,对齐 sub2api v0.1.178);超限按 tools(后往前)→ messages(前往后)→ system 顺序删 |
 | 模型映射 | ✅ | 配置 `model_map`(精确名 + `"*"` 兜底);body.model 替换 + 响应流(含 SSE)模型名还原为请求名 |
 | 流式 | ✅ | SSE 事件级重组透传(保持事件边界 + 实时 flush,顺带解析 usage);含 count_tokens 端点(beta 追加 token-counting) |
 
@@ -119,9 +119,61 @@ git tag v0.1.0 && git push origin v0.1.0
 | 会话池 `session_pool_size` | 3 | 上游同时可见的 session_id 数;下游会话稳定映射槽位 |
 | 会话轮换 `session_rotate_min/max_minutes` | 120/360 | 槽位寿命随机区间(隔数小时换新 session,避免长期固定同一 ID) |
 | 日预算 `daily_token_budget` | 0(关) | 每 key 每日 input+cache+output 合计上限,超出 429;按本地日期重置 |
-| 画像 `GET /stats` | — | 每 key 实时:并发/RPM/活跃会话数/今日 token 与请求数,核对单用户使用特征 |
+| 画像 `GET /stats` | — | 每 key 实时:并发/RPM/活跃会话数/今日 token 与请求数/冻结截止,核对单用户使用特征 |
+| 额度 `GET /quota` | — | 查询智谱 Coding Plan 滚动窗口用量(5h/周档、套餐等级);事件驱动探测(30s 缓存);`?refresh=true` 实时探测并清除该 key 冻结(适配套餐升级场景) |
+| 窗口上限冻结 | ✅ | 上游 429 消息解析重置时间(如 1308),冻结期内 429 + Retry-After 不发上游;冻结上限 24h(周上限场景每 24h 放行探针重新学得);quota 时间戳自动校准冻结时刻 |
 
 状态落盘:`data/identity.json`(客户端身份)、`data/sessions.json`(会话池)、`data/usage.json`(用量)。
+
+## 运维端点使用方法
+
+所有端点都通过 `Authorization: Bearer <key>`(或 `x-api-key`)携带下游 key。
+
+**查询额度(智谱 Coding Plan 滚动窗口用量)**:
+
+```bash
+# 免 key 列表模式:浏览器/curl 直接打开,列出所有出现过的 key 的额度
+curl http://127.0.0.1:8080/quota
+
+# 带 key:查单个 key(语义同上,30 秒缓存)
+curl -H "Authorization: Bearer <你的key>" http://127.0.0.1:8080/quota
+```
+
+```json
+{
+  "keys": [
+    {
+      "key": "5f911b0c",
+      "quota": {
+        "plan_level": "PRO",
+        "tiers": [
+          { "window": "5h", "used_percent": 87.5, "reset_at": "2026-08-14T12:01:13Z" }
+        ]
+      },
+      "cooldown_until": ""
+    }
+  ]
+}
+```
+
+- 列表模式基于内存 KeyRing(身份键 → key 原文**只存内存、永不落盘**;重启后由各 key 的首个请求重新记录),对外只显示身份键前 8 位,不回显 key 原文
+- 单 5h 套餐只返回 `5h` 一档;默认 30 秒缓存不打上游
+- **套餐升级/额度已刷新时**,用 `?refresh=true` 实时探测并**清除冻结**(列表模式会刷新全部 key):
+
+```bash
+curl -H "Authorization: Bearer <你的key>" "http://127.0.0.1:8080/quota?refresh=true"
+```
+
+**查看行为画像**:
+
+```bash
+curl http://127.0.0.1:8080/stats
+# 每 key:并发/RPM/活跃会话数/今日 token 与请求数/cooldown_until(冻结截止,空=无冻结)
+```
+
+**冻结行为**:上游返回窗口上限错误(如 1308"已达到 5 小时的使用上限…重置")时,网关解析重置时间冻结该 key——冻结期内请求直接 429 + `Retry-After`,不再发上游;冻结到期自动恢复(并后台确认额度),也可用 `?refresh=true` 提前解除。
+
+**健康检查**:`GET /healthz`。
 
 ## 未完成(后续)
 

@@ -69,6 +69,9 @@ func EnforceCacheControlLimit(body []byte) []byte {
 	if len(body) == 0 {
 		return body
 	}
+	// 延迟加载工具携带 cache_control 会被上游拒绝整个请求,先统一剥离
+	// (sub2api v0.1.178 stripDeferredToolCacheControl,issue #4990)。
+	body = StripDeferredToolCacheControl(body)
 	var top map[string]json.RawMessage
 	if err := json.Unmarshal(body, &top); err != nil {
 		return body
@@ -266,4 +269,66 @@ func isThinkingBlock(blk map[string]json.RawMessage) bool {
 	}
 	var t string
 	return json.Unmarshal(raw, &t) == nil && t == "thinking"
+}
+
+// isDeferredLoadingTool 判断 tool 是否为延迟加载工具:
+// 官方顶层 defer_loading 或 Claude Code 使用的 custom.defer_loading,
+// 且只有 JSON 字面量 true 才启用(字符串 "true"/数字 1/false 均不算,
+// 对齐 sub2api 的 literal-true 语义,有测试锁定)。
+func isDeferredLoadingTool(tool map[string]json.RawMessage) bool {
+	if rawLiteralTrue(tool["defer_loading"]) {
+		return true
+	}
+	var custom map[string]json.RawMessage
+	if raw, ok := tool["custom"]; ok && json.Unmarshal(raw, &custom) == nil {
+		return rawLiteralTrue(custom["defer_loading"])
+	}
+	return false
+}
+
+func rawLiteralTrue(raw json.RawMessage) bool {
+	if len(raw) == 0 {
+		return false
+	}
+	var b bool
+	return json.Unmarshal(raw, &b) == nil && b
+}
+
+// StripDeferredToolCacheControl 移植自 sub2api gateway_tool_rewrite.go
+// (v0.1.178, issue #4990):上游不允许 defer_loading=true 的工具携带
+// cache_control,违反则整个请求被拒。剥离 deferred 工具上的 cache_control,
+// 非 deferred 工具的断点原样保留。
+func StripDeferredToolCacheControl(body []byte) []byte {
+	var top map[string]json.RawMessage
+	if err := json.Unmarshal(body, &top); err != nil {
+		return body
+	}
+	rawTools, ok := top["tools"]
+	if !ok {
+		return body
+	}
+	var tools []map[string]json.RawMessage
+	if err := json.Unmarshal(rawTools, &tools); err != nil {
+		return body
+	}
+	changed := false
+	for i, tool := range tools {
+		if _, has := tool["cache_control"]; !has {
+			continue
+		}
+		if isDeferredLoadingTool(tool) {
+			delete(tools[i], "cache_control")
+			changed = true
+		}
+	}
+	if !changed {
+		return body
+	}
+	if b, err := json.Marshal(tools); err == nil {
+		top["tools"] = b
+		if out, err := json.Marshal(top); err == nil {
+			return out
+		}
+	}
+	return body
 }

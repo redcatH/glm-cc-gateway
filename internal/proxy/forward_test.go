@@ -2,13 +2,16 @@ package proxy
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -502,5 +505,167 @@ func TestPruneDumps(t *testing.T) {
 	}
 	if _, err := os.Stat(newer); err != nil {
 		t.Fatal("fresh dump must survive")
+	}
+}
+
+// 用户提供的真实 1308 错误体(窗口上限,消息自带重置时间)。
+const body429WindowLimit = `{"error":{"code":"1308","message":"[1308][已达到 5 小时的使用上限。您的限额将在 2999-12-31 23:59:59 重置。][x]","type":"rate_limit_error"},"request_id":"x","type":"error"}`
+
+func TestForwardWindowLimitFreeze(t *testing.T) {
+	var upstreamHits int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost {
+			// 推理请求:返回 1308 窗口上限。
+			atomic.AddInt32(&upstreamHits, 1)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusTooManyRequests)
+			w.Write([]byte(body429WindowLimit)) //nolint:errcheck
+			return
+		}
+		// 额度探测(GET):返回带 5h 档的 quota。
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"success":true,"data":{"level":"PRO","limits":[{"type":"TOKENS_LIMIT","unit":3,"percentage":30}]}}`)) //nolint:errcheck
+	}))
+	t.Cleanup(upstream.Close)
+
+	cfg := &config.Config{
+		IdentityFile:       filepath.Join(t.TempDir(), "identity.json"),
+		UpstreamBaseURL:    upstream.URL,
+		UpstreamAuthScheme: "bearer",
+		UpstreamPath:       "/v1/messages?beta=true",
+		MaxBodyBytes:       1 << 20,
+		MaxUpstreamRetries: 2,
+	}
+	ident, _ := mimic.NewIdentityStore("")
+	f := New(cfg, ident)
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/messages", f.HandleMessages(cfg.UpstreamPath, nil))
+	mux.HandleFunc("GET /quota", func(w http.ResponseWriter, r *http.Request) {
+		apiKey := ExtractAPIKey(r)
+		if apiKey == "" {
+			http.Error(w, "missing key", http.StatusUnauthorized)
+			return
+		}
+		refresh := r.URL.Query().Get("refresh") == "true" || r.URL.Query().Get("refresh") == "1"
+		result, err := f.Quota(r.Context(), mimic.KeyIdentityHash(apiKey), apiKey, refresh)
+		if err != nil {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadGateway)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(result) //nolint:errcheck
+	})
+	gw := httptest.NewServer(mux)
+	t.Cleanup(gw.Close)
+
+	body := `{"model":"m","messages":[{"role":"user","content":"hi"}],"stream":false}`
+
+	// 第一击:上游返回 1308 → 冻结设置 + 原样透传 + Retry-After,不重试。
+	resp := postMessages(t, gw.URL, map[string]string{"Authorization": "Bearer k"}, body)
+	if resp.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("status = %d", resp.StatusCode)
+	}
+	b, _ := io.ReadAll(resp.Body)
+	if !strings.Contains(string(b), "1308") {
+		t.Fatalf("original error body must pass through: %s", b)
+	}
+	if ra := resp.Header.Get("Retry-After"); ra == "" {
+		t.Fatal("Retry-After missing")
+	}
+	if n := atomic.LoadInt32(&upstreamHits); n != 1 {
+		t.Fatalf("window-limit 429 must not retry, upstream hits = %d", n)
+	}
+
+	// 第二击:冻结期内直接 429,不再发上游。
+	resp2 := postMessages(t, gw.URL, map[string]string{"Authorization": "Bearer k"}, body)
+	if resp2.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("frozen status = %d", resp2.StatusCode)
+	}
+	b2, _ := io.ReadAll(resp2.Body)
+	if !strings.Contains(string(b2), "cooldown active") || resp2.Header.Get("Retry-After") == "" {
+		t.Fatalf("frozen response wrong: %s", b2)
+	}
+	if n := atomic.LoadInt32(&upstreamHits); n != 1 {
+		t.Fatalf("frozen request must not reach upstream, hits = %d", n)
+	}
+
+	// /quota?refresh=true 解冻。
+	req, _ := http.NewRequest(http.MethodGet, gw.URL+"/quota?refresh=true", nil)
+	req.Header.Set("Authorization", "Bearer k")
+	qresp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	qb, _ := io.ReadAll(qresp.Body)
+	qresp.Body.Close()
+	if qresp.StatusCode != http.StatusOK || !strings.Contains(string(qb), "PRO") || !strings.Contains(string(qb), "5h") {
+		t.Fatalf("quota response = %d %s", qresp.StatusCode, qb)
+	}
+
+	// 解冻后第三击:恢复转发(重新打到上游)。
+	resp3 := postMessages(t, gw.URL, map[string]string{"Authorization": "Bearer k"}, body)
+	if resp3.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("post-refresh status = %d", resp3.StatusCode)
+	}
+	if n := atomic.LoadInt32(&upstreamHits); n != 2 {
+		t.Fatalf("refresh must clear freeze, hits = %d", n)
+	}
+}
+
+func TestQuotaAllWithoutKey(t *testing.T) {
+	var quotaHits int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			atomic.AddInt32(&quotaHits, 1)
+			w.Header().Set("Content-Type", "application/json")
+			w.Write([]byte(`{"success":true,"data":{"level":"PRO","limits":[{"type":"TOKENS_LIMIT","unit":3,"percentage":30}]}}`)) //nolint:errcheck
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(upstream.Close)
+
+	cfg := &config.Config{
+		IdentityFile:       filepath.Join(t.TempDir(), "identity.json"),
+		UpstreamBaseURL:    upstream.URL,
+		UpstreamAuthScheme: "bearer",
+		UpstreamPath:       "/v1/messages?beta=true",
+		MaxBodyBytes:       1 << 20,
+	}
+	ident, _ := mimic.NewIdentityStore("")
+	f := New(cfg, ident)
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/messages", f.HandleMessages(cfg.UpstreamPath, nil))
+	gw := httptest.NewServer(mux)
+	t.Cleanup(gw.Close)
+
+	// 无 key 列表模式:KeyRing 为空 → 空列表。
+	entries := f.QuotaAll(context.Background(), false)
+	if len(entries) != 0 {
+		t.Fatalf("empty ring must return empty list, got %d", len(entries))
+	}
+
+	// 经过一次请求后,KeyRing 记录该 key → 列表可反查(不回显原文)。
+	postMessages(t, gw.URL, map[string]string{"Authorization": "Bearer sk-abc"},
+		`{"model":"m","messages":[{"role":"user","content":"hi"}],"stream":false}`)
+	entries = f.QuotaAll(context.Background(), false)
+	if len(entries) != 1 {
+		t.Fatalf("expected 1 entry, got %d", len(entries))
+	}
+	wantPrefix := mimic.KeyIdentityHash("sk-abc")[:8]
+	if entries[0].Key != wantPrefix || len(entries[0].Key) != 8 || strings.Contains(fmt.Sprint(entries[0]), "sk-abc") {
+		t.Fatalf("entry must expose 8-char hash prefix only: %+v", entries[0])
+	}
+	if entries[0].Quota == nil || entries[0].Quota.PlanLevel != "PRO" {
+		t.Fatalf("quota not probed: %+v", entries[0])
+	}
+	if atomic.LoadInt32(&quotaHits) != 1 {
+		t.Fatalf("quota hits = %d(缓存/列表探测异常)", quotaHits)
+	}
+	// 再次列表(30s 缓存):不打上游。
+	f.QuotaAll(context.Background(), false)
+	if atomic.LoadInt32(&quotaHits) != 1 {
+		t.Fatalf("cache miss in list mode, hits = %d", quotaHits)
 	}
 }

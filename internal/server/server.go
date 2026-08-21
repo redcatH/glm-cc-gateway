@@ -38,6 +38,28 @@ func New(cfg *config.Config, ident *mimic.IdentityStore) http.Handler {
 		json.NewEncoder(w).Encode(map[string]any{"keys": f.Stats()}) //nolint:errcheck
 	})
 
+	// 额度查询:
+	//   GET /quota(带 key)→ 查该 key(30s 缓存)
+	//   GET /quota?refresh=true(带 key)→ 实时探测 + 清除该 key 冻结(套餐升级场景)
+	//   GET /quota(不带 key)→ 列出内存中所有出现过的 key 的额度(原文仅内存,
+	//                          重启后由各 key 首个请求重新记录)
+	mux.HandleFunc("GET /quota", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		apiKey := proxy.ExtractAPIKey(r)
+		if apiKey == "" {
+			json.NewEncoder(w).Encode(map[string]any{"keys": f.QuotaAll(r.Context(), r.URL.Query().Get("refresh") == "true" || r.URL.Query().Get("refresh") == "1")}) //nolint:errcheck
+			return
+		}
+		refresh := r.URL.Query().Get("refresh") == "true" || r.URL.Query().Get("refresh") == "1"
+		result, err := f.Quota(r.Context(), mimic.KeyIdentityHash(apiKey), apiKey, refresh)
+		if err != nil {
+			w.WriteHeader(http.StatusBadGateway)
+			json.NewEncoder(w).Encode(map[string]any{"type": "error", "message": err.Error()}) //nolint:errcheck
+			return
+		}
+		json.NewEncoder(w).Encode(result) //nolint:errcheck
+	})
+
 	// 兜底:打印未匹配的 method+path,方便排查客户端路径拼错类问题。
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		slog.Warn("no route", "method", r.Method, "path", r.URL.Path)
